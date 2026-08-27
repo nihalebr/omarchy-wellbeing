@@ -1,0 +1,8 @@
+# atomic-write temp files (the service writes <day>.json.part then renames)
+*.part
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store
+.qmlls.ini

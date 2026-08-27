@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# omarchy-wellbeing — print screen-time stats collected by the Digital
+# Wellbeing shell plugin (nihalebr.wellbeing).
+#
+# The plugin's service writes one JSON file per local day to
+#   ~/.local/state/omarchy/wellbeing/YYYY-MM-DD.json
+# This script just formats them. Symlink it onto your PATH if you want it
+# handy, e.g.:
+#   ln -s ~/.config/omarchy/plugins/nihalebr.wellbeing/bin/omarchy-wellbeing ~/.local/bin/
+
+set -euo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/wellbeing"
+
+usage() {
+  cat <<EOF
+Usage: omarchy-wellbeing [day] [--bars] [--json]
+       omarchy-wellbeing --list
+       omarchy-wellbeing --week
+
+day     today (default) | yesterday | -N (N days ago) | YYYY-MM-DD
+--bars  draw a text bar next to each app
+--week  one-line totals for the last 7 days
+--list  list every day that has data
+--json  print the raw day file
+EOF
+}
+
+resolve_day() {
+  case "${1:-today}" in
+    today) date +%F ;;
+    yesterday) date -d yesterday +%F ;;
+    -[0-9]*) date -d "${1#-} days ago" +%F ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) echo "$1" ;;
+    *) echo "omarchy-wellbeing: bad day '$1'" >&2; exit 1 ;;
+  esac
+}
+
+fmt_dur() { # seconds -> "1h 04m" / "12m" / "8s"
+  local s=${1%.*}
+  (( s < 0 )) && s=0
+  if (( s >= 3600 )); then printf '%dh %02dm' $((s/3600)) $(((s%3600)/60))
+  elif (( s >= 60 )); then printf '%dm' $((s/60))
+  else printf '%ds' "$s"; fi
+}
+
+day_total() {
+  local f="$STATE_DIR/$1.json"
+  [[ -f $f ]] || { echo 0; return; }
+  jq -r '[.apps[].seconds] | add // 0 | floor' "$f"
+}
+
+cmd_list() {
+  [[ -d $STATE_DIR ]] || { echo "No data yet ($STATE_DIR)"; exit 0; }
+  local f b
+  for f in "$STATE_DIR"/*.json; do
+    [[ -f $f ]] || continue
+    b=$(basename "$f" .json)
+    printf '%s  %s\n' "$b" "$(fmt_dur "$(day_total "$b")")"
+  done
+}
+
+cmd_week() {
+  local i key total
+  for i in 6 5 4 3 2 1 0; do
+    key=$(date -d "$i days ago" +%F)
+    total=$(day_total "$key")
+    printf '%s  %-3s  %s\n' "$key" "$(date -d "$key" +%a)" "$(fmt_dur "$total")"
+  done
+}
+
+cmd_day() {
+  local day bars=0 json=0
+  day=""
+  for a in "$@"; do
+    case "$a" in
+      --bars) bars=1 ;;
+      --json) json=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) day="$a" ;;
+    esac
+  done
+  local key f
+  key=$(resolve_day "${day:-today}")
+  f="$STATE_DIR/$key.json"
+
+  if [[ ! -f $f ]]; then
+    echo "No data for $key"
+    exit 0
+  fi
+  if (( json )); then
+    jq . "$f"
+    exit 0
+  fi
+
+  local total switches napps
+  total=$(jq -r '[.apps[].seconds] | add // 0 | floor' "$f")
+  switches=$(jq -r '.switches // 0' "$f")
+  napps=$(jq -r '[.apps[] | select(.seconds > 0)] | length' "$f")
+
+  printf '\e[1m%s\e[0m   %s screen time   ·   %s apps   ·   %s switches\n\n' \
+    "$key" "$(fmt_dur "$total")" "$napps" "$switches"
+
+  # rows: "seconds\tappId"
+  local maxsec
+  maxsec=$(jq -r '[.apps[].seconds] | max // 1' "$f")
+  jq -r '.apps | to_entries
+         | map(select(.value.seconds > 0))
+         | sort_by(-.value.seconds)[]
+         | "\(.value.seconds|floor)\t\(.key)\t\(.value.name // "")"' "$f" |
+  while IFS=$'\t' read -r sec appid name; do
+    local bar=""
+    [[ -z $name ]] && name=$(pretty_name "$appid")
+    if (( bars )); then
+      local width=$(( sec * 24 / (maxsec > 0 ? maxsec : 1) ))
+      (( width < 1 && sec > 0 )) && width=1
+      bar=" $(printf '%*s' "$width" '' | tr ' ' '#')"
+    fi
+    printf '  %-22s %8s%s\n' "$name" "$(fmt_dur "$sec")" "$bar"
+  done
+}
+
+pretty_name() {
+  case "$1" in
+    firefox|org.mozilla.firefox) echo Firefox ;;
+    google-chrome|chrome) echo Chrome ;;
+    chromium|chromium-browser) echo Chromium ;;
+    brave-browser|brave) echo Brave ;;
+    code|code-oss|code-url-handler) echo "VS Code" ;;
+    Alacritty|org.alacritty.Alacritty) echo Alacritty ;;
+    kitty) echo Kitty ;;
+    ghostty|com.mitchellh.ghostty) echo Ghostty ;;
+    org.omarchy.agent) echo "AI Agent" ;;
+    org.gnome.Nautilus|nautilus) echo Files ;;
+    spotify|com.spotify.Client) echo Spotify ;;
+    org.telegram.desktop) echo Telegram ;;
+    "") echo Desktop ;;
+    *)
+      # Browser web app (chrome-<host>__…-Default): show the host.
+      if [[ $1 =~ ^(chrome|chromium|brave|brave-browser|msedge|microsoft-edge|vivaldi|vivaldi-stable|opera|helium)-(.+)$ ]]; then
+        local rest="${BASH_REMATCH[2]}"
+        rest="${rest%-Default}"
+        rest="${rest%-Profile_*}"
+        local host="${rest%%_*}"
+        host="${host%.}"
+        if [[ $host == *.*[a-z] ]]; then
+          echo "$host"
+          return
+        fi
+      fi
+      # last dotted segment, separators to spaces, title-cased
+      local core="${1##*.}"
+      core="${core//[-_]/ }"
+      echo "$core" | awk '{for(i=1;i<=NF;i++)$i=toupper(substr($i,1,1))substr($i,2)}1'
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  --list) cmd_list ;;
+  --week) cmd_week ;;
+  -h|--help) usage ;;
+  *) cmd_day "$@" ;;
+esac

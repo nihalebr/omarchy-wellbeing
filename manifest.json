@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "id": "nihalebr.wellbeing",
+  "name": "Digital Wellbeing",
+  "version": "1.0.0",
+  "author": "nihalebr",
+  "license": "MIT",
+  "description": "Tracks which applications you use the most and for how long, like Android's Digital Wellbeing. A bar icon opens a breakdown of today's screen time by app, an hourly timeline, and the last seven days.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Digital Wellbeing",
+    "description": "Screen-time tracker with a per-app breakdown popup",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "sampleSeconds": 5,
+      "idleTimeoutSeconds": 180,
+      "showLabel": "Off",
+      "dailyGoalMinutes": 0,
+      "historyDays": 14
+    },
+    "schema": [
+      {
+        "key": "showLabel",
+        "type": "enum",
+        "label": "Show today's total in the bar",
+        "options": ["Off", "On"],
+        "defaultValue": "Off",
+        "description": "When On, the bar shows the running screen-time total next to the icon."
+      },
+      {
+        "key": "dailyGoalMinutes",
+        "type": "integer",
+        "label": "Daily goal (minutes)",
+        "min": 0,
+        "max": 1440,
+        "step": 15,
+        "defaultValue": 0,
+        "description": "Optional. When set, the popup shows progress toward this limit and the bar icon turns urgent once you pass it. 0 disables the goal."
+      },
+      {
+        "key": "idleTimeoutSeconds",
+        "type": "integer",
+        "label": "Count as away after (seconds idle)",
+        "min": 30,
+        "max": 1800,
+        "step": 30,
+        "defaultValue": 180,
+        "description": "Time with no keyboard or mouse input before tracking pauses."
+      },
+      {
+        "key": "sampleSeconds",
+        "type": "integer",
+        "label": "Sampling interval (seconds)",
+        "min": 2,
+        "max": 30,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How often the focused window is polled. Lower is more precise, higher is lighter."
+      },
+      {
+        "key": "historyDays",
+        "type": "integer",
+        "label": "History to keep (days)",
+        "min": 7,
+        "max": 400,
+        "step": 1,
+        "defaultValue": 14,
+        "description": "Day files older than this are pruned on startup."
+      }
+    ]
+  }
+}
