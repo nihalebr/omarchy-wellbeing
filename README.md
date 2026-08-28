@@ -27,7 +27,7 @@ The Omarchy shell loads plugins from `~/.config/omarchy/plugins/<id>/`. Link
 this repo in as `nihalebr.wellbeing` and enable it:
 
 ```bash
-git clone https://github.com/<you>/omarchy-wellbeing.git ~/src/omarchy-wellbeing
+git clone https://github.com/nihalebr/omarchy-wellbeing.git ~/src/omarchy-wellbeing
 ln -s ~/src/omarchy-wellbeing ~/.config/omarchy/plugins/nihalebr.wellbeing
 omarchy restart shell
 omarchy plugin enable nihalebr.wellbeing --section right
