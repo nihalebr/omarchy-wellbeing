@@ -154,6 +154,12 @@ omarchy-shell nihalebr.wellbeing reset today  # wipe a day (today | yesterday | 
 - Each holds per-app seconds, a focus-switch count, and 24 hourly buckets. App
   window titles are not stored beyond the last title seen per app (used only as
   a hint), and nothing leaves the machine.
+- The service owns `~/.local/state/omarchy/wellbeing/`: it creates the directory
+  `0700`, refuses to use it if it is a symlink or is not owned by you, writes
+  each day file `0600` through an unpredictable temp name and an atomic rename,
+  and never passes a record on a command line. If you have symlinked that path
+  elsewhere, the service will log a warning and skip persistence — move the real
+  directory back, or point `XDG_STATE_HOME` at the location you want.
 - Delete a day by removing its file, or all of it by removing the folder.
 
 ## How time is counted

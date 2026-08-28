@@ -1,4 +1,6 @@
-# atomic-write temp files (the service writes <day>.json.part then renames)
+# atomic-write temp files (the service writes an mktemp'd .<day>.json.XXXXXX
+# then renames it into place; older builds used <day>.json.part)
+.*.json.*
 *.part
 
 # editor / OS noise

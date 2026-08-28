@@ -13,6 +13,15 @@ set -euo pipefail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/wellbeing"
 
+# The reporter only ever reads. Refuse a state dir that is a symlink, and treat
+# only plain files as day files, so a planted link can't redirect a read.
+if [[ -L $STATE_DIR ]]; then
+  echo "omarchy-wellbeing: $STATE_DIR is a symlink; refusing" >&2
+  exit 1
+fi
+
+is_day_file() { [[ -f $1 && ! -L $1 ]]; }
+
 usage() {
   cat <<EOF
 Usage: omarchy-wellbeing [day] [--bars] [--json]
@@ -47,7 +56,7 @@ fmt_dur() { # seconds -> "1h 04m" / "12m" / "8s"
 
 day_total() {
   local f="$STATE_DIR/$1.json"
-  [[ -f $f ]] || { echo 0; return; }
+  is_day_file "$f" || { echo 0; return; }
   jq -r '[.apps[].seconds] | add // 0 | floor' "$f"
 }
 
@@ -55,7 +64,7 @@ cmd_list() {
   [[ -d $STATE_DIR ]] || { echo "No data yet ($STATE_DIR)"; exit 0; }
   local f b
   for f in "$STATE_DIR"/*.json; do
-    [[ -f $f ]] || continue
+    is_day_file "$f" || continue
     b=$(basename "$f" .json)
     printf '%s  %s\n' "$b" "$(fmt_dur "$(day_total "$b")")"
   done
@@ -85,7 +94,7 @@ cmd_day() {
   key=$(resolve_day "${day:-today}")
   f="$STATE_DIR/$key.json"
 
-  if [[ ! -f $f ]]; then
+  if ! is_day_file "$f"; then
     echo "No data for $key"
     exit 0
   fi

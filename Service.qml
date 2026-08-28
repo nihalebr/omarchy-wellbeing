@@ -90,7 +90,29 @@ Item {
     property var dirty: ({})
     property bool writeAgain: false
 
-    readonly property string writeScript: 'dir="$1"; shift; mkdir -p "$dir" || exit 1; ' + 'while [ "$#" -ge 2 ]; do f="$dir/$1.json"; ' + 'printf "%s" "$2" > "$f.part" && mv -f "$f.part" "$f"; shift 2; done'
+    // Set once the state dir has been checked and hardened (see maintenanceProc);
+    // nothing is read or written before this.
+    property bool dirChecked: false
+
+    // The day files hold app_ids and, as a display hint, the last window title
+    // seen per app, so the writer is deliberately careful with them:
+    //   - refuses a state dir that is a symlink or that this user does not own,
+    //     and forces it to 0700
+    //   - writes each file through an unpredictable mktemp name at mode 0600 and
+    //     publishes it with rename(2), which replaces a symlink at the target
+    //     rather than following it
+    //   - never puts a record on argv: live writes stream in on stdin (exactly
+    //     `mode` lines), the shutdown write arrives in $WELLBEING_PAYLOAD
+    //     (owner-only in /proc/<pid>/environ).
+    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "wellbeing: $dir is a symlink; refusing to write" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "wellbeing: $dir is not a directory this user owns; refusing" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    mv -f "$tmp" "$dir/$key.json"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
+
+    // Runs once at startup, before any day file is read. Guarantees the state
+    // dir is one we own at 0700, then removes anything a reader (the FileViews
+    // here and in the bar widget, `jq` in bin/omarchy-wellbeing) should never be
+    // pointed at: non-regular files (a planted symlink or fifo), oversized
+    // files, history past the retention window, and stale temp files from an
+    // interrupted write. Also normalises any legacy day file to 0600.
+    readonly property string maintenanceScript: ['set -u', 'dir=$1; keep=${2:-14}', 'umask 077', '[ -n "$dir" ] || exit 0', '[ -L "$dir" ] && exit 0', 'mkdir -p "$dir" 2>/dev/null || exit 0', '{ [ -d "$dir" ] && [ -O "$dir" ]; } || exit 0', 'chmod 700 "$dir" 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 ! -type d ! -type f -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -size +8M -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f \\( -name ".*.json.*" -o -name "*.part" \\) -mmin +60 -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -exec chmod 600 {} + 2>/dev/null || true', 'exit 0'].join("\n")
 
     // ------------------------------------------------------------- day records
 
@@ -275,31 +297,42 @@ Item {
 
     // ------------------------------------------------------------- persistence
 
-    function flush() {
-        var keys = Object.keys(dirty);
-        if (keys.length === 0)
-            return;
-        if (writeProc.running) {
-            writeAgain = true;
-            return;
-        }
-
-        var args = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir];
-        var wrote = 0;
+    // Collect the dirty day records as "<YYYY-MM-DD> <compact-json>" lines. The
+    // key is safe on argv/stdin; the record body never is.
+    function pendingLines(keys) {
+        var lines = [];
         for (var i = 0; i < keys.length; i++) {
             var rec = days[keys[i]];
             if (!rec)
                 continue;
             rec.updated = new Date().toISOString();
-            args.push(keys[i]);
-            args.push(JSON.stringify(rec));
-            wrote++;
+            lines.push(keys[i] + " " + JSON.stringify(rec));
         }
-        dirty = ({});
-        if (wrote === 0)
+        return lines;
+    }
+
+    function flush() {
+        var keys = Object.keys(dirty);
+        if (keys.length === 0)
             return;
-        writeProc.command = args;
+        if (!dirChecked || writeProc.running) {
+            writeAgain = true;
+            return;
+        }
+
+        var lines = pendingLines(keys);
+        dirty = ({});
+        if (lines.length === 0)
+            return;
+
+        // Records stream in on stdin; only the state dir and the line count ride
+        // on argv.
+        writeProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, String(lines.length)];
         writeProc.running = true;
+        Qt.callLater(function () {
+            for (var j = 0; j < lines.length; j++)
+                writeProc.write(lines[j] + "\n");
+        });
     }
 
     function flushDetached() {
@@ -308,19 +341,17 @@ Item {
             keys.push(todayKey);
         if (keys.length === 0)
             return;
-        var args = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir];
-        var wrote = 0;
-        for (var i = 0; i < keys.length; i++) {
-            var rec = days[keys[i]];
-            if (!rec)
-                continue;
-            rec.updated = new Date().toISOString();
-            args.push(keys[i]);
-            args.push(JSON.stringify(rec));
-            wrote++;
-        }
-        if (wrote > 0)
-            Quickshell.execDetached(args);
+        var lines = pendingLines(keys);
+        if (lines.length === 0)
+            return;
+        // Shutdown path: a detached process has no stdin pipe from us, so the
+        // records ride in the environment (owner-only in /proc/<pid>/environ),
+        // never on argv.
+        detachedWriteProc.environment = ({
+                "WELLBEING_PAYLOAD": lines.join("\n") + "\n"
+            });
+        detachedWriteProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, "env"];
+        detachedWriteProc.startDetached();
     }
 
     function resetDay(day) {
@@ -338,7 +369,7 @@ Item {
             lastSampleAt = Date.now();
             refreshSummary();
         }
-        Quickshell.execDetached(["bash", "-c", 'rm -f "$1/$2.json" "$1/$2.json.part"', "wellbeing-reset", root.stateDir, key]);
+        Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; rm -f "$d/$k.json" "$d/$k.json.part"; rm -f "$d/.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
         return "ok";
     }
 
@@ -373,6 +404,12 @@ Item {
         flush();
         ensureDay(todayKey);
         refreshSummary();
+    }
+
+    // Once the dir is hardened, drain anything that piled up while we waited.
+    onDirCheckedChanged: {
+        if (dirChecked && Object.keys(dirty).length > 0)
+            flush();
     }
 
     IdleMonitor {
@@ -420,10 +457,12 @@ Item {
 
     // Load today's file (a shell restart mid-day must not lose the morning).
     // Nothing is credited until this resolves, so the parsed record is a safe
-    // straight assignment rather than a merge.
+    // straight assignment rather than a merge. The path stays empty — so the
+    // FileView never touches disk — until maintenanceProc has hardened the dir
+    // and swept out anything a bare read should not follow.
     FileView {
         id: todayLoader
-        path: root.stateDir + "/" + root.todayKey + ".json"
+        path: root.dirChecked ? (root.stateDir + "/" + root.todayKey + ".json") : ""
         watchChanges: false
         printErrors: false
         onLoaded: {
@@ -459,6 +498,7 @@ Item {
     Process {
         id: writeProc
         running: false
+        stdinEnabled: true
         onExited: function (exitCode) {
             if (exitCode !== 0)
                 console.warn("wellbeing: write exited", exitCode);
@@ -469,18 +509,27 @@ Item {
         }
     }
 
-    // Prune old day files once, a beat after startup.
+    // Shutdown-only writer, driven by flushDetached() via startDetached().
     Process {
-        id: pruneProc
+        id: detachedWriteProc
         running: false
-        command: ["bash", "-c", 'dir="$1"; keep="$2"; [ -d "$dir" ] || exit 0; ' + 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null; ' + 'find "$dir" -maxdepth 1 -type f -name "*.part" -mmin "+60" -delete 2>/dev/null; exit 0', "wellbeing-prune", root.stateDir, String(root.historyDays)]
     }
 
+    // Harden the state dir and clear anything a reader should never follow,
+    // before the first day file is loaded.
+    Process {
+        id: maintenanceProc
+        running: false
+        command: ["bash", "-c", root.maintenanceScript, "wellbeing-maint", root.stateDir, String(root.historyDays)]
+        onExited: root.dirChecked = true
+    }
+
+    // Belt and braces: if the maintenance pass never reports back, read anyway.
     Timer {
-        interval: 8000
-        running: true
+        interval: 3000
+        running: !root.dirChecked
         repeat: false
-        onTriggered: pruneProc.running = true
+        onTriggered: root.dirChecked = true
     }
 
     // host<TAB>name for every installed web app, from the .desktop launchers.
@@ -533,7 +582,10 @@ Item {
         }
     }
 
-    Component.onCompleted: console.log("wellbeing: service ready, state dir", root.stateDir)
+    Component.onCompleted: {
+        console.log("wellbeing: service ready, state dir", root.stateDir);
+        maintenanceProc.running = true;
+    }
     Component.onDestruction: {
         root.sample();
         root.flushDetached();
