@@ -16,7 +16,12 @@ BarWidget {
     moduleName: "nihalebr.wellbeing"
 
     readonly property string home: Quickshell.env("HOME")
-    readonly property string stateDir: home + "/.local/state/omarchy/wellbeing"
+    // Match the service and bin/omarchy-wellbeing: honour XDG_STATE_HOME.
+    readonly property string stateHome: {
+        var x = Quickshell.env("XDG_STATE_HOME");
+        return x && x.length > 0 ? x : home + "/.local/state";
+    }
+    readonly property string stateDir: stateHome + "/omarchy/wellbeing"
 
     readonly property bool showLabel: String(setting("showLabel", "Off")) === "On"
     readonly property int goalMinutes: {
@@ -179,11 +184,11 @@ BarWidget {
 
     Process {
         id: historyProc
-        // Reader: skip a state dir or day file that is a symlink, and cap how
-        // much of each file is read, so this can never be pointed at an
-        // unrelated or unbounded file. The service hardens the dir to 0700 and
-        // sweeps out non-regular files at startup; this is the belt to that.
-        command: ["bash", "-c", 'dir="$1"; { [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + '{ [ -f "$f" ] && [ ! -L "$f" ]; } || continue; ' + 'b=$(basename "$f" .json); printf "===%s===\\n" "$b"; head -c 2000000 "$f"; printf "\\n"; done', "wellbeing-history", root.stateDir]
+        // Reader: skip a state dir or day file that is a symlink, and cap each
+        // read at the same 8 MB the service treats as the largest legitimate day
+        // file, so this can never be pointed at an unrelated or unbounded file
+        // and never truncates a real record into invalid JSON.
+        command: ["bash", "-c", 'dir="$1"; { [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + '{ [ -f "$f" ] && [ ! -L "$f" ]; } || continue; ' + 'b=$(basename "$f" .json); printf "===%s===\\n" "$b"; head -c 8000000 "$f"; printf "\\n"; done', "wellbeing-history", root.stateDir]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: root.history = Model.parseHistoryDump(text)
