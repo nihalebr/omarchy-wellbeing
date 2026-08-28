@@ -22,7 +22,13 @@ Item {
     property string omarchyPath: Quickshell.env("OMARCHY_PATH")
 
     readonly property string home: Quickshell.env("HOME")
-    readonly property string stateDir: home + "/.local/state/omarchy/wellbeing"
+    // Honour XDG_STATE_HOME (bin/omarchy-wellbeing already does), so the reporter
+    // and the service always agree on where the data lives.
+    readonly property string stateHome: {
+        var x = Quickshell.env("XDG_STATE_HOME");
+        return x && x.length > 0 ? x : home + "/.local/state";
+    }
+    readonly property string stateDir: stateHome + "/omarchy/wellbeing"
 
     // The service loader does not hand a service its widget settings, so read the
     // widget's shell.json layout entry off the live shell config directly. This
@@ -90,24 +96,26 @@ Item {
     property var dirty: ({})
     property bool writeAgain: false
 
-    // Set once the state dir has been checked and hardened (see maintenanceProc);
-    // nothing is read or written before this. dirUsable stays true unless the
-    // maintenance pass reports the dir is a symlink / not ours, in which case the
-    // readers stay inert too (the writer refuses on its own).
-    property bool dirChecked: false
-    property bool dirUsable: true
+    // maintenanceProc reports back through these, and only once it has actually
+    // exited — a slow sweep can never expose an unswept file to todayLoader:
+    //   dirReady    - the dir is one we own at 0700 and has been swept of
+    //                 anything a bare read must not follow. Gates the readers.
+    //   dirRejected - the dir is a symlink or is not ours. The writers skip it
+    //                 and the readers stay inert.
+    property bool dirReady: false
+    property bool dirRejected: false
 
     // The day files hold app_ids and, as a display hint, the last window title
     // seen per app, so the writer is deliberately careful with them:
     //   - refuses a state dir that is a symlink or that this user does not own,
     //     and forces it to 0700
     //   - writes each file through an unpredictable mktemp name at mode 0600 and
-    //     publishes it with rename(2), which replaces a symlink at the target
-    //     rather than following it
+    //     publishes it with `mv -fT` — a plain rename that replaces a symlink at
+    //     the target and never descends into one that points at a directory
     //   - never puts a record on argv: live writes stream in on stdin (exactly
     //     `mode` lines), the shutdown write arrives in $WELLBEING_PAYLOAD
     //     (owner-only in /proc/<pid>/environ).
-    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    mv -f "$tmp" "$dir/$key.json"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
+    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    mv -fT "$tmp" "$dir/$key.json"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
 
     // Runs once at startup, before any day file is read. Guarantees the state
     // dir is one we own at 0700, then removes anything a reader (the FileViews
@@ -318,35 +326,37 @@ Item {
         var keys = Object.keys(dirty);
         if (keys.length === 0)
             return;
-        if (dirChecked && !dirUsable) {
-            // The state dir failed its check (symlink / not ours). maintenanceProc
-            // already logged why; drop the pending writes rather than respawn a
-            // doomed writer every 15s.
+        if (dirRejected) {
+            // maintenanceProc logged why the dir is unusable; drop the pending
+            // writes rather than respawn a doomed writer every 15s.
             dirty = ({});
             return;
         }
-        if (!dirChecked || writeProc.running) {
+        if (writeProc.running) {
             writeAgain = true;
             return;
         }
 
         var lines = pendingLines(keys);
-        dirty = ({});
-        if (lines.length === 0)
+        if (lines.length === 0) {
+            dirty = ({});
             return;
+        }
 
         // Records stream in on stdin; only the state dir and the line count ride
-        // on argv.
+        // on argv. Write synchronously and clear `dirty` only once the lines are
+        // buffered to the process, so a stalled event loop can't strand them
+        // past the writer's read timeout. The writeScript hardens the dir on its
+        // own, so this does not need to wait on maintenanceProc.
         writeProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, String(lines.length)];
         writeProc.running = true;
-        Qt.callLater(function () {
-            for (var j = 0; j < lines.length; j++)
-                writeProc.write(lines[j] + "\n");
-        });
+        for (var j = 0; j < lines.length; j++)
+            writeProc.write(lines[j] + "\n");
+        dirty = ({});
     }
 
     function flushDetached() {
-        if (dirChecked && !dirUsable)
+        if (dirRejected)
             return;
         var keys = Object.keys(dirty);
         if (keys.indexOf(todayKey) === -1 && days[todayKey])
@@ -381,7 +391,11 @@ Item {
             lastSampleAt = Date.now();
             refreshSummary();
         }
-        Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; rm -f "$d/$k.json" "$d/$k.json.part"; rm -f "$d/.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
+        // `key` is already validated as YYYY-MM-DD above. Guard the dir the same
+        // way the writer does — a symlinked or swapped stateDir must not let this
+        // rm resolve into some other directory.
+        if (!dirRejected)
+            Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; { [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]; } || exit 0; rm -f -- "$d/$k.json" "$d/$k.json.part"; rm -f -- "$d/.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
         return "ok";
     }
 
@@ -418,9 +432,9 @@ Item {
         refreshSummary();
     }
 
-    // Once the dir is hardened, drain anything that piled up while we waited.
-    onDirCheckedChanged: {
-        if (dirChecked && Object.keys(dirty).length > 0)
+    // Once the dir is confirmed good, drain anything that piled up while we waited.
+    onDirReadyChanged: {
+        if (dirReady && Object.keys(dirty).length > 0)
             flush();
     }
 
@@ -470,11 +484,12 @@ Item {
     // Load today's file (a shell restart mid-day must not lose the morning).
     // Nothing is credited until this resolves, so the parsed record is a safe
     // straight assignment rather than a merge. The path stays empty — so the
-    // FileView never touches disk — until maintenanceProc has hardened the dir
-    // and swept out anything a bare read should not follow.
+    // FileView never touches disk — until maintenanceProc has exited cleanly,
+    // having hardened the dir and swept out anything a bare read should not
+    // follow. No timeout shortcut: a slow sweep must finish first.
     FileView {
         id: todayLoader
-        path: (root.dirChecked && root.dirUsable) ? (root.stateDir + "/" + root.todayKey + ".json") : ""
+        path: root.dirReady ? (root.stateDir + "/" + root.todayKey + ".json") : ""
         watchChanges: false
         printErrors: false
         onLoaded: {
@@ -550,18 +565,14 @@ Item {
             }
         }
         onExited: function (exitCode) {
-            if (exitCode === 3)
-                root.dirUsable = false;
-            root.dirChecked = true;
+            // exit 0: dir owned + swept, safe to read. exit 3: symlink / not
+            // ours, stay off it. Anything else: not swept and not proven bad —
+            // readers stay inert, the self-hardening writer carries on.
+            if (exitCode === 0)
+                root.dirReady = true;
+            else if (exitCode === 3)
+                root.dirRejected = true;
         }
-    }
-
-    // Belt and braces: if the maintenance pass never reports back, read anyway.
-    Timer {
-        interval: 3000
-        running: !root.dirChecked
-        repeat: false
-        onTriggered: root.dirChecked = true
     }
 
     // host<TAB>name for every installed web app, from the .desktop launchers.
