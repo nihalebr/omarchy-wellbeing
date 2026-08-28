@@ -1,5 +1,7 @@
 # Digital Wellbeing for Omarchy
 
+![Digital Wellbeing for Omarchy](assets/cover.png)
+
 A screen-time tracker for the Omarchy shell, in the spirit of Android's Digital
 Wellbeing. It watches which application is focused, adds up the time per app for
 each day, and shows the breakdown in a bar popup: today's total, a seven-day
@@ -7,6 +9,33 @@ strip, an hourly timeline, and a most-used list.
 
 Everything stays on your machine — one plain JSON file per day under
 `~/.local/state/omarchy/wellbeing/`. Nothing is sent anywhere.
+
+## Screenshots
+
+<table>
+<tr>
+<td width="44%" valign="top">
+<img src="assets/popup.png" alt="The screen-time breakdown popup" width="100%">
+</td>
+<td valign="top">
+
+**The breakdown popup.** Today's total with an optional daily goal, a
+seven-day strip, an hour-by-hour timeline, and the most-used apps each with
+a usage meter. Browser web apps resolve to their real names (YouTube, GitHub,
+Slack…) instead of a synthetic `app_id`.
+
+<br>
+
+<img src="assets/bar.png" alt="The bar widget" width="78%">
+
+**In the bar.** An hourglass, optionally with today's running total beside it.
+Left-click opens the popup; it can also be summoned from a keybinding.
+
+<sub>Screenshots use sample data.</sub>
+
+</td>
+</tr>
+</table>
 
 ## What it does
 
