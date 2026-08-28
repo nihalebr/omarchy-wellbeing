@@ -50,6 +50,13 @@ Left-click opens the popup; it can also be summoned from a keybinding.
   a 7-day bar strip (click a day to jump to it), an hour-by-hour timeline,
   and the most-used apps with time and a usage meter.
 
+## Requirements
+
+A stock Omarchy install (shell v4 / Quattro or newer) is all the plugin itself
+needs. The optional `bin/omarchy-wellbeing` terminal reporter also calls `jq`,
+which Omarchy already ships. No other external dependencies, and nothing is
+downloaded or built at install or run time.
+
 ## Install
 
 ```bash
@@ -191,3 +198,9 @@ omarchy plugin disable nihalebr.wellbeing
 rm -rf ~/.config/omarchy/plugins/nihalebr.wellbeing
 rm -rf ~/.local/state/omarchy/wellbeing        # optional: the collected data
 ```
+
+Or, for a git-managed install: `omarchy plugin remove nihalebr.wellbeing`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
