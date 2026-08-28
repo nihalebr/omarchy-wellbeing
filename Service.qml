@@ -91,8 +91,11 @@ Item {
     property bool writeAgain: false
 
     // Set once the state dir has been checked and hardened (see maintenanceProc);
-    // nothing is read or written before this.
+    // nothing is read or written before this. dirUsable stays true unless the
+    // maintenance pass reports the dir is a symlink / not ours, in which case the
+    // readers stay inert too (the writer refuses on its own).
     property bool dirChecked: false
+    property bool dirUsable: true
 
     // The day files hold app_ids and, as a display hint, the last window title
     // seen per app, so the writer is deliberately careful with them:
@@ -104,7 +107,7 @@ Item {
     //   - never puts a record on argv: live writes stream in on stdin (exactly
     //     `mode` lines), the shutdown write arrives in $WELLBEING_PAYLOAD
     //     (owner-only in /proc/<pid>/environ).
-    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "wellbeing: $dir is a symlink; refusing to write" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "wellbeing: $dir is not a directory this user owns; refusing" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    mv -f "$tmp" "$dir/$key.json"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
+    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    mv -f "$tmp" "$dir/$key.json"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
 
     // Runs once at startup, before any day file is read. Guarantees the state
     // dir is one we own at 0700, then removes anything a reader (the FileViews
@@ -112,7 +115,7 @@ Item {
     // pointed at: non-regular files (a planted symlink or fifo), oversized
     // files, history past the retention window, and stale temp files from an
     // interrupted write. Also normalises any legacy day file to 0600.
-    readonly property string maintenanceScript: ['set -u', 'dir=$1; keep=${2:-14}', 'umask 077', '[ -n "$dir" ] || exit 0', '[ -L "$dir" ] && exit 0', 'mkdir -p "$dir" 2>/dev/null || exit 0', '{ [ -d "$dir" ] && [ -O "$dir" ]; } || exit 0', 'chmod 700 "$dir" 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 ! -type d ! -type f -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -size +8M -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f \\( -name ".*.json.*" -o -name "*.part" \\) -mmin +60 -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -exec chmod 600 {} + 2>/dev/null || true', 'exit 0'].join("\n")
+    readonly property string maintenanceScript: ['set -u', 'dir=$1; keep=${2:-14}', 'umask 077', '[ -n "$dir" ] || exit 0', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; wellbeing will not read or write it" >&2; exit 3; fi', 'mkdir -p "$dir" 2>/dev/null || { echo "cannot create state dir $dir" >&2; exit 3; }', '{ [ -d "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns" >&2; exit 3; }', 'chmod 700 "$dir" 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 ! -type d ! -type f -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -size +8M -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f \\( -name ".*.json.*" -o -name "*.part" \\) -mmin +60 -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -exec chmod 600 {} + 2>/dev/null || true', 'exit 0'].join("\n")
 
     // ------------------------------------------------------------- day records
 
@@ -315,6 +318,13 @@ Item {
         var keys = Object.keys(dirty);
         if (keys.length === 0)
             return;
+        if (dirChecked && !dirUsable) {
+            // The state dir failed its check (symlink / not ours). maintenanceProc
+            // already logged why; drop the pending writes rather than respawn a
+            // doomed writer every 15s.
+            dirty = ({});
+            return;
+        }
         if (!dirChecked || writeProc.running) {
             writeAgain = true;
             return;
@@ -336,6 +346,8 @@ Item {
     }
 
     function flushDetached() {
+        if (dirChecked && !dirUsable)
+            return;
         var keys = Object.keys(dirty);
         if (keys.indexOf(todayKey) === -1 && days[todayKey])
             keys.push(todayKey);
@@ -462,7 +474,7 @@ Item {
     // and swept out anything a bare read should not follow.
     FileView {
         id: todayLoader
-        path: root.dirChecked ? (root.stateDir + "/" + root.todayKey + ".json") : ""
+        path: (root.dirChecked && root.dirUsable) ? (root.stateDir + "/" + root.todayKey + ".json") : ""
         watchChanges: false
         printErrors: false
         onLoaded: {
@@ -499,9 +511,18 @@ Item {
         id: writeProc
         running: false
         stdinEnabled: true
+        // Surface the writer's own diagnostics (a refused state dir, a failed
+        // rename) instead of just an exit code in the journal.
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = String(text).trim();
+                if (msg)
+                    console.warn("wellbeing:", msg);
+            }
+        }
         onExited: function (exitCode) {
             if (exitCode !== 0)
-                console.warn("wellbeing: write exited", exitCode);
+                console.warn("wellbeing: write exited", exitCode, "— day data was not saved");
             if (root.writeAgain) {
                 root.writeAgain = false;
                 root.flush();
@@ -521,7 +542,18 @@ Item {
         id: maintenanceProc
         running: false
         command: ["bash", "-c", root.maintenanceScript, "wellbeing-maint", root.stateDir, String(root.historyDays)]
-        onExited: root.dirChecked = true
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = String(text).trim();
+                if (msg)
+                    console.warn("wellbeing:", msg);
+            }
+        }
+        onExited: function (exitCode) {
+            if (exitCode === 3)
+                root.dirUsable = false;
+            root.dirChecked = true;
+        }
     }
 
     // Belt and braces: if the maintenance pass never reports back, read anyway.

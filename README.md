@@ -157,9 +157,10 @@ omarchy-shell nihalebr.wellbeing reset today  # wipe a day (today | yesterday | 
 - The service owns `~/.local/state/omarchy/wellbeing/`: it creates the directory
   `0700`, refuses to use it if it is a symlink or is not owned by you, writes
   each day file `0600` through an unpredictable temp name and an atomic rename,
-  and never passes a record on a command line. If you have symlinked that path
-  elsewhere, the service will log a warning and skip persistence — move the real
-  directory back, or point `XDG_STATE_HOME` at the location you want.
+  and never passes a record on a command line. If that path is a symlink the
+  service logs a warning (`journalctl --user | grep omarchy-shell`) and does not
+  persist — replace it with a real directory, or set `XDG_STATE_HOME` to move the
+  whole tree somewhere else.
 - Delete a day by removing its file, or all of it by removing the folder.
 
 ## How time is counted
