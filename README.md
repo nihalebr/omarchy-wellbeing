@@ -52,8 +52,29 @@ Left-click opens the popup; it can also be summoned from a keybinding.
 
 ## Install
 
-The Omarchy shell loads plugins from `~/.config/omarchy/plugins/<id>/`. Link
-this repo in as `nihalebr.wellbeing` and enable it:
+```bash
+omarchy plugin add https://github.com/nihalebr/omarchy-wellbeing.git --enable
+```
+
+That clones the plugin to `~/.config/omarchy/plugins/nihalebr.wellbeing/`, drops
+the hourglass into the right of the bar, and starts the tracker. Add `--yes` to
+skip the prompts. Pull later updates with:
+
+```bash
+omarchy plugin update nihalebr.wellbeing
+```
+
+Move it like any widget, or turn it off:
+
+```bash
+omarchy bar move   nihalebr.wellbeing --section right --before omarchy.tray
+omarchy plugin disable nihalebr.wellbeing
+omarchy plugin remove  nihalebr.wellbeing
+```
+
+### Hacking on it
+
+To work on the plugin, symlink a checkout in instead of using `plugin add`:
 
 ```bash
 git clone https://github.com/nihalebr/omarchy-wellbeing.git ~/src/omarchy-wellbeing
@@ -62,24 +83,7 @@ omarchy restart shell
 omarchy plugin enable nihalebr.wellbeing --section right
 ```
 
-(A plain `cp -r` into the plugins directory works too — the symlink just keeps
-one copy so `git pull` updates the running plugin.)
-
-That drops the hourglass into the right side of the bar and starts the tracker.
-Move it like any widget:
-
-```bash
-omarchy bar move nihalebr.wellbeing --section right --before omarchy.tray
-```
-
-Disable / re-enable:
-
-```bash
-omarchy plugin disable nihalebr.wellbeing
-omarchy plugin enable  nihalebr.wellbeing
-```
-
-> **After editing the plugin's `.qml`,** a `omarchy restart shell` is the
+> **After editing the plugin's `.qml`,** an `omarchy restart shell` is the
 > reliable way to pick the change up — the in-place hot reload sometimes keeps
 > a cached copy of a widget component.
 
