@@ -23,10 +23,11 @@ Item {
 
     readonly property string home: Quickshell.env("HOME")
     // Honour XDG_STATE_HOME (bin/omarchy-wellbeing already does), so the reporter
-    // and the service always agree on where the data lives.
+    // and the service always agree on where the data lives. Per the XDG spec a
+    // relative value is invalid and must be ignored.
     readonly property string stateHome: {
         var x = Quickshell.env("XDG_STATE_HOME");
-        return x && x.length > 0 ? x : home + "/.local/state";
+        return x && x.length > 0 && x[0] === "/" ? x : home + "/.local/state";
     }
     readonly property string stateDir: stateHome + "/omarchy/wellbeing"
 

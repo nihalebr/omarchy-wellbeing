@@ -16,10 +16,11 @@ BarWidget {
     moduleName: "nihalebr.wellbeing"
 
     readonly property string home: Quickshell.env("HOME")
-    // Match the service and bin/omarchy-wellbeing: honour XDG_STATE_HOME.
+    // Match the service and bin/omarchy-wellbeing: honour an absolute
+    // XDG_STATE_HOME, ignore a relative one per the XDG spec.
     readonly property string stateHome: {
         var x = Quickshell.env("XDG_STATE_HOME");
-        return x && x.length > 0 ? x : home + "/.local/state";
+        return x && x.length > 0 && x[0] === "/" ? x : home + "/.local/state";
     }
     readonly property string stateDir: stateHome + "/omarchy/wellbeing"
 
