@@ -179,7 +179,11 @@ BarWidget {
 
     Process {
         id: historyProc
-        command: ["bash", "-c", 'dir="$1"; [ -d "$dir" ] || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + 'b=$(basename "$f" .json); printf "===%s===\\n" "$b"; cat "$f"; printf "\\n"; done', "wellbeing-history", root.stateDir]
+        // Reader: skip a state dir or day file that is a symlink, and cap how
+        // much of each file is read, so this can never be pointed at an
+        // unrelated or unbounded file. The service hardens the dir to 0700 and
+        // sweeps out non-regular files at startup; this is the belt to that.
+        command: ["bash", "-c", 'dir="$1"; { [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + '{ [ -f "$f" ] && [ ! -L "$f" ]; } || continue; ' + 'b=$(basename "$f" .json); printf "===%s===\\n" "$b"; head -c 2000000 "$f"; printf "\\n"; done', "wellbeing-history", root.stateDir]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: root.history = Model.parseHistoryDump(text)
