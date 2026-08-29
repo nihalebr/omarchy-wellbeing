@@ -113,10 +113,11 @@ Item {
     //   - writes each file through an unpredictable mktemp name at mode 0600 and
     //     publishes it with `mv -fT` — a plain rename that replaces a symlink at
     //     the target and never descends into one that points at a directory
-    //   - never puts a record on argv: live writes stream in on stdin (exactly
-    //     `mode` lines), the shutdown write arrives in $WELLBEING_PAYLOAD
-    //     (owner-only in /proc/<pid>/environ).
-    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-env}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || rm -f "$tmp"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  ""|*[!0-9]*)', '    printf "%s" "${WELLBEING_PAYLOAD:-}" | while IFS= read -r line || [ -n "$line" ]; do', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
+    //   - never puts a record on argv or in the environment: live writes stream
+    //     in on stdin (exactly `mode` lines); the shutdown flush drops them in
+    //     an unpredictable `.shutdown-*` temp file (`mode` = `file:<path>`,
+    //     confined to this dir) that a detached reader consumes and unlinks.
+    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || rm -f "$tmp"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  file:*)', '    f=${mode#file:}', '    case $f in "$dir"/.shutdown-*) ;; *) exit 0 ;; esac', '    { [ -f "$f" ] && [ ! -L "$f" ]; } || exit 0', '    chmod 600 "$f" 2>/dev/null || true', '    while IFS= read -r line; do', '      [ -n "$line" ] && write_one "$line"', '    done < <(timeout 5 dd if="$f" iflag=nofollow,count_bytes count=16777216 bs=65536 2>/dev/null)', '    rm -f "$f"', '    ;;', '  ""|*[!0-9]*)', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
 
     // Runs once at startup, before any day file is read. Guarantees the state
     // dir is one we own at 0700, then removes anything a reader (the FileViews
@@ -126,7 +127,7 @@ Item {
     // since `mv -fT` can't replace a directory), oversized files, history past
     // the retention window, and stale temp files from an interrupted write.
     // Also normalises any legacy day file to 0600.
-    readonly property string maintenanceScript: ['set -u', 'dir=$1; keep=${2:-14}', 'umask 077', '[ -n "$dir" ] || exit 0', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; wellbeing will not read or write it" >&2; exit 3; fi', 'mkdir -p "$dir" 2>/dev/null || { echo "cannot create state dir $dir" >&2; exit 3; }', '{ [ -d "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns" >&2; exit 3; }', 'chmod 700 "$dir" 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 ! -type d ! -type f -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 -type d -name "????-??-??.json" -exec rm -rf -- {} + 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -size +8M -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f \\( -name ".*.json.*" -o -name "*.part" \\) -mmin +60 -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -exec chmod 600 {} + 2>/dev/null || true', 'exit 0'].join("\n")
+    readonly property string maintenanceScript: ['set -u', 'dir=$1; keep=${2:-14}', 'umask 077', '[ -n "$dir" ] || exit 0', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; wellbeing will not read or write it" >&2; exit 3; fi', 'mkdir -p "$dir" 2>/dev/null || { echo "cannot create state dir $dir" >&2; exit 3; }', '{ [ -d "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns" >&2; exit 3; }', 'chmod 700 "$dir" 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 ! -type d ! -type f -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -mindepth 1 -type d -name "????-??-??.json" -exec rm -rf -- {} + 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -size +8M -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -mtime "+$keep" -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f \\( -name ".*.json.*" -o -name "*.part" -o -name ".shutdown-*" \\) -mmin +60 -delete 2>/dev/null || true', 'find "$dir" -maxdepth 1 -type f -name "*.json" -exec chmod 600 {} + 2>/dev/null || true', 'exit 0'].join("\n")
 
     // ------------------------------------------------------------- day records
 
@@ -369,14 +370,17 @@ Item {
         var lines = pendingLines(keys);
         if (lines.length === 0)
             return;
-        // Shutdown path: a detached process has no stdin pipe from us, so the
-        // records ride in the environment (owner-only in /proc/<pid>/environ),
-        // never on argv.
-        detachedWriteProc.environment = ({
-                "WELLBEING_PAYLOAD": lines.join("\n") + "\n"
-            });
-        detachedWriteProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, "env"];
-        detachedWriteProc.startDetached();
+        // Shutdown path: there is no stdin pipe to a detached process, and an
+        // argv/env string is capped at MAX_ARG_STRLEN (128 KiB) — a heavy day,
+        // or a midnight rollover carrying two dirty days, can exceed that and
+        // then persist nothing. Write the records to an unpredictable temp file
+        // now (synchronously) and let a detached reader consume and unlink it.
+        var tmp = root.stateDir + "/.shutdown-" + Date.now() + "-" + Math.floor(Math.random() * 1e9) + ".ndjson";
+        shutdownPayloadFile.path = tmp;
+        shutdownPayloadFile.setText(lines.join("\n") + "\n");
+        if (shutdownPayloadFile.waitForJob)
+            shutdownPayloadFile.waitForJob();
+        Quickshell.execDetached(["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, "file:" + tmp]);
     }
 
     function resetDay(day) {
@@ -551,10 +555,12 @@ Item {
         }
     }
 
-    // Shutdown-only writer, driven by flushDetached() via startDetached().
-    Process {
-        id: detachedWriteProc
-        running: false
+    // Writes the shutdown payload temp file synchronously (see flushDetached).
+    FileView {
+        id: shutdownPayloadFile
+        blockWrites: true
+        atomicWrites: true
+        printErrors: false
     }
 
     // Harden the state dir and clear anything a reader should never follow,
