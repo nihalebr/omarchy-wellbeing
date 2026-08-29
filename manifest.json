@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "nihalebr.wellbeing",
   "name": "Digital Wellbeing",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "author": "nihalebr",
   "license": "MIT",
   "description": "Tracks which applications you use the most and for how long, like Android's Digital Wellbeing. A bar icon opens a breakdown of today's screen time by app, an hourly timeline, and the last seven days.",
