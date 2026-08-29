@@ -27,6 +27,13 @@ Item {
     // spec) so all three always agree on where the data lives.
     readonly property string stateDir: Model.stateDirFrom(home, Quickshell.env("XDG_STATE_HOME"))
 
+    // Private per-user scratch dir for the shutdown payload (see flushDetached).
+    // Absolute or nothing — a relative value is not a dir we can trust.
+    readonly property string runtimeDir: {
+        var r = Quickshell.env("XDG_RUNTIME_DIR");
+        return r && r.length > 0 && r[0] === "/" ? r : "";
+    }
+
     // The service loader does not hand a service its widget settings, so read the
     // widget's shell.json layout entry off the live shell config directly. This
     // re-evaluates whenever the config is reloaded.
@@ -128,11 +135,14 @@ Item {
     //     in on stdin (exactly `mode` lines); the shutdown flush drops them in
     //     a `wellbeing-shutdown-*.ndjson` temp file under $XDG_RUNTIME_DIR — a
     //     private 0700 tmpfs dir that cannot be swapped for a symlink — which a
-    //     detached reader drains (`mode` = `file:<path>`) and, only on full
-    //     success, unlinks. `mode` = `replay` re-drains (into empty day slots
-    //     only, so it can't clobber a fresh session) any payload a previous run
-    //     could not persist. $3 = $XDG_RUNTIME_DIR for both.
-    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-}; rtdir=${3:-}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || { rm -f "$tmp"; return 1; }', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'write_gap() {', '  gk=${1%% *}', '  case $gk in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  { [ -e "$dir/$gk.json" ] || [ -L "$dir/$gk.json" ]; } && return 0', '  write_one "$1"', '}', 'drain_payload() {', '  wf=$1; p=$2; prc=0', '  { [ -f "$p" ] && [ ! -L "$p" ]; } || return 0', '  chmod 600 "$p" 2>/dev/null || true', '  while IFS= read -r pl; do [ -n "$pl" ] && { "$wf" "$pl" || prc=1; }; done < <(timeout 5 dd if="$p" iflag=nofollow,count_bytes count=16777216 bs=65536 2>/dev/null)', '  [ "$prc" -eq 0 ] && rm -f "$p"', '  return "$prc"', '}', 'case $mode in', '  file:*)', '    f=${mode#file:}', '    case ${f##*/} in wellbeing-shutdown-*.ndjson) ;; *) exit 0 ;; esac', '    drain_payload write_one "$f"; exit $?', '    ;;', '  replay)', '    { [ -n "$rtdir" ] && [ -d "$rtdir" ] && [ ! -L "$rtdir" ]; } || exit 0', '    shopt -s nullglob', '    rc=0', '    for pf in "$rtdir"/wellbeing-shutdown-*.ndjson; do drain_payload write_gap "$pf" || rc=1; done', '    exit "$rc"', '    ;;', '  ""|*[!0-9]*)', '    ;;', '  *)', '    i=0; rc=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 10 line || break', '      i=$((i + 1))', '      if [ -n "$line" ]; then write_one "$line" || rc=1; fi', '    done', '    [ "$i" -eq "$mode" ] || rc=1', '    exit "$rc"', '    ;;', 'esac'].join("\n")
+    //     detached reader drains (`mode` = `file:<path>`), reads whole (dd
+    //     status checked, size checked against the cap) and unlinks only on
+    //     full success. `mode` = `replay` (runs before the readers open today,
+    //     $3 = $XDG_RUNTIME_DIR) re-drains any payload a previous run could not
+    //     persist, replacing a day file only when the payload record is newer
+    //     (by `updated`) so it can neither lose the deferred tail nor clobber a
+    //     day a later session already advanced.
+    readonly property string writeScript: ['set -u', 'export LC_ALL=C', 'dir=$1; mode=${2:-}; rtdir=${3:-}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'CAP=16777216', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || { rm -f "$tmp"; return 1; }', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'field_updated() { sed -n "s/.*\\"updated\\":\\"\\([^\\"]*\\)\\".*/\\1/p" | head -n 1; }', 'write_newer() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  cur="$dir/$key.json"', '  if [ -f "$cur" ] && [ ! -L "$cur" ]; then', '    du=$(head -c "$CAP" "$cur" 2>/dev/null | field_updated)', '    nu=$(printf "%s" "$json" | field_updated)', '    if [ -n "$du" ] && [ -n "$nu" ] && [[ ! "$nu" > "$du" ]]; then return 0; fi', '  fi', '  write_one "$line"', '}', 'drain_payload() {', '  wf=$1; p=$2; prc=0', '  { [ -f "$p" ] && [ ! -L "$p" ]; } || return 0', '  psz=$(wc -c < "$p" 2>/dev/null) || return 1', '  { [ -n "$psz" ] && [ "$psz" -ge 2 ] && [ "$psz" -le "$CAP" ]; } || return 1', '  chmod 600 "$p" 2>/dev/null || true', '  cont=$(timeout 10 dd if="$p" iflag=nofollow,count_bytes count="$CAP" bs=65536 2>/dev/null) || return 1', '  [ -n "$cont" ] || return 1', '  while IFS= read -r pl; do [ -n "$pl" ] && { "$wf" "$pl" || prc=1; }; done <<< "$cont"', '  [ "$prc" -eq 0 ] && rm -f "$p"', '  return "$prc"', '}', 'case $mode in', '  file:*)', '    f=${mode#file:}', '    case ${f##*/} in wellbeing-shutdown-*.ndjson) ;; *) exit 0 ;; esac', '    drain_payload write_one "$f"; exit $?', '    ;;', '  replay)', '    { [ -n "$rtdir" ] && [ -d "$rtdir" ] && [ ! -L "$rtdir" ]; } || exit 0', '    shopt -s nullglob', '    rc=0', '    for pf in "$rtdir"/wellbeing-shutdown-*.ndjson; do drain_payload write_newer "$pf" || rc=1; done', '    exit "$rc"', '    ;;', '  ""|*[!0-9]*)', '    ;;', '  *)', '    i=0; rc=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 10 line || break', '      i=$((i + 1))', '      if [ -n "$line" ]; then write_one "$line" || rc=1; fi', '    done', '    [ "$i" -eq "$mode" ] || rc=1', '    exit "$rc"', '    ;;', 'esac'].join("\n")
 
     // Runs once at startup, before any day file is read. Guarantees the state
     // dir is one we own at 0700, then removes anything a reader (the FileViews
@@ -425,10 +435,9 @@ Item {
         // cannot have been swapped for a symlink since startup — so FileView's
         // symlink-following write can't be redirected. If the reader can't
         // persist every record it leaves the file for the next start's replay.
-        var rtdir = Quickshell.env("XDG_RUNTIME_DIR");
-        if (!rtdir || rtdir[0] !== "/")
+        if (!runtimeDir)
             return; // no private scratch dir; the last flush() (<=15s ago) stands
-        var tmp = rtdir + "/wellbeing-shutdown-" + Date.now() + "-" + Math.floor(Math.random() * 1e9) + ".ndjson";
+        var tmp = runtimeDir + "/wellbeing-shutdown-" + Date.now() + "-" + Math.floor(Math.random() * 1e9) + ".ndjson";
         shutdownPayloadFile.path = tmp;
         shutdownPayloadFile.setText(lines.join("\n") + "\n");
         if (shutdownPayloadFile.waitForJob)
@@ -659,18 +668,42 @@ Item {
             }
         }
         onExited: function (exitCode) {
-            // exit 0: dir owned + swept, safe to read. exit 3: symlink / not
-            // ours, stay off it. Anything else: not swept and not proven bad —
-            // readers stay inert, the self-hardening writer carries on.
-            if (exitCode === 0) {
-                root.dirReady = true;
-                // Re-drain any shutdown payload a previous run failed to persist.
-                var rtdir = Quickshell.env("XDG_RUNTIME_DIR");
-                if (rtdir && rtdir[0] === "/")
-                    Quickshell.execDetached(["bash", "-c", root.writeScript, "wellbeing-replay", root.stateDir, "replay", rtdir]);
-            } else if (exitCode === 3) {
+            // exit 0: dir owned + swept. exit 3: symlink / not ours, stay off
+            // it. Anything else: not swept and not proven bad — readers stay
+            // inert, the self-hardening writer carries on.
+            if (exitCode === 3) {
                 root.dirRejected = true;
+                return;
             }
+            if (exitCode !== 0)
+                return;
+            // Re-drain any shutdown payload a previous run could not persist,
+            // and only then open the readers — a recovered day must land on
+            // disk before todayLoader reads it, or this session's stale copy
+            // would overwrite it straight back.
+            if (root.runtimeDir)
+                replayProc.running = true;
+            else
+                root.dirReady = true;
+        }
+    }
+
+    // Gating step between maintenanceProc and the readers: drains a leftover
+    // shutdown payload (if any) into the state dir. A failure here just means
+    // the payload waits for the next start, so the readers open regardless.
+    Process {
+        id: replayProc
+        running: false
+        command: ["bash", "-c", root.writeScript, "wellbeing-replay", root.stateDir, "replay", root.runtimeDir]
+        stderr: StdioCollector {
+            onStreamFinished: {
+                var msg = String(text).trim();
+                if (msg)
+                    console.warn("wellbeing:", msg);
+            }
+        }
+        onExited: function (exitCode) {
+            root.dirReady = true;
         }
     }
 
