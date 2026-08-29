@@ -99,18 +99,17 @@ Item {
     // Pending-write bookkeeping.
     property var dirty: ({})
     property bool writeAgain: false
-    // Keys handed to the running writeProc; cleared from `dirty` only once it
-    // exits 0 (see writeProc.onExited), so a partial or failed write leaves the
-    // records queued for the next attempt instead of dropping them.
+    // Keys handed to the running writeProc. `dirty` is cleared for them when the
+    // write is dispatched; if it then exits non-zero they are all re-marked
+    // (see writeProc.onExited), so a partial or failed write is retried.
     property var writingKeys: []
     property bool lastWriteFailed: false
 
     // Set once today's file has been read back this session (todayLoader
-    // onLoaded/onLoadFailed). Until then the writers hold today's record back
-    // rather than risk a near-empty in-memory record overwriting a file whose
-    // contents this session has never seen. Reset on the midnight rollover.
+    // onLoaded/onLoadFailed). Until then sample() credits nothing and the
+    // writers hold today's record back, so an in-memory partial can never
+    // overwrite the fuller copy on disk. Reset on the midnight rollover.
     property bool todayLoaded: false
-    property bool warnedHeldToday: false
 
     // maintenanceProc reports back through these, and only once it has actually
     // exited — a slow sweep can never expose an unswept file to todayLoader:
@@ -307,7 +306,13 @@ Item {
             return;
         }
 
-        if (lastSampleAt > 0 && lastActive && active && currentAppId !== "") {
+        // Don't touch any day record until today's file has been read back this
+        // session (todayLoaded) — a record credited before then would be a
+        // partial with a fresh timestamp, which a later flush or the shutdown
+        // replay would mistake for the newest state and write over the fuller
+        // copy on disk. The lost window is just the startup sweep + replay,
+        // normally well under a second.
+        if (todayLoaded && lastSampleAt > 0 && lastActive && active && currentAppId !== "") {
             var dt = (now - lastSampleAt) / 1000;
             var maxDt = root.sampleSeconds * 2.5;
             // Below the floor is jitter; above the ceiling is a gap we can't account
@@ -324,7 +329,7 @@ Item {
             }
         }
 
-        if (active && appId !== "" && appId !== currentAppId)
+        if (todayLoaded && active && appId !== "" && appId !== currentAppId)
             registerOpen(appId);
         if (active && appId !== "")
             noteWebApp(appId);
@@ -352,8 +357,8 @@ Item {
     }
 
     function flush() {
-        var all = Object.keys(dirty);
-        if (all.length === 0)
+        var keys = Object.keys(dirty);
+        if (keys.length === 0)
             return;
         if (dirRejected) {
             // maintenanceProc logged why the dir is unusable; drop the pending
@@ -361,45 +366,31 @@ Item {
             dirty = ({});
             return;
         }
-        // Wait for maintenanceProc to harden and sweep the dir before writing;
-        // whatever queues up in the meantime drains from onDirReadyChanged.
+        // Wait for maintenanceProc + the replay step to harden and sweep the
+        // dir; whatever queues up meanwhile drains from onDirReadyChanged. (Only
+        // todayKey can be dirty, and only once todayLoaded — sample() credits
+        // nothing before that — so there is nothing to write here yet anyway.)
         if (!dirReady)
             return;
-
-        // Hold today's record back until its file has been read this session —
-        // a slow start must not let a near-empty in-memory record overwrite the
-        // morning still sitting on disk. Other days are always safe to write.
-        var keys = all;
-        if (!todayLoaded) {
-            keys = [];
-            for (var k = 0; k < all.length; k++)
-                if (all[k] !== todayKey)
-                    keys.push(all[k]);
-            if (!warnedHeldToday && keys.length !== all.length) {
-                warnedHeldToday = true;
-                console.warn("wellbeing: today's file has not loaded yet — holding its writes back so a slow start can't overwrite it");
-            }
-            if (keys.length === 0)
-                return;
-        }
 
         if (writeProc.running) {
             writeAgain = true;
             return;
         }
 
+        var d = dirty;
+        for (var m = 0; m < keys.length; m++)
+            delete d[keys[m]];
+        dirty = d;
+
         var lines = pendingLines(keys);
-        if (lines.length === 0) {
-            var d = dirty;
-            for (var m = 0; m < keys.length; m++)
-                delete d[keys[m]];
-            dirty = d;
+        if (lines.length === 0)
             return;
-        }
 
         // Records stream in on stdin; only the state dir and the line count ride
-        // on argv. `dirty` is cleared for these keys only once writeProc exits 0
-        // (see onExited), so a partial or failed write keeps them queued.
+        // on argv. `dirty` is cleared for these keys now — a credit that lands
+        // mid-write re-marks its key and is caught by the next flush; a partial
+        // or failed write (writeProc exit != 0) re-queues every sent key.
         writeProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, String(lines.length)];
         writingKeys = keys.slice();
         writeProc.running = true;
@@ -418,9 +409,13 @@ Item {
         for (var i = 0; i < dk.length; i++)
             if (dk[i] !== todayKey)
                 keys.push(dk[i]);
-        // Force-add today (it is usually not "dirty" in the strict sense), but
-        // only once its file has been loaded this session.
-        if (todayLoaded && days[todayKey])
+        // Force-add today (it is usually not "dirty" in the strict sense) when
+        // it holds real tracked time. Before todayLoader resolves, sample()
+        // credits nothing, so an untouched empty record here means there is
+        // genuinely nothing to persist — including it would only let the replay
+        // write an empty record with a fresh timestamp over the fuller disk copy.
+        var td = days[todayKey];
+        if (td && (td.totalSeconds > 0 || td.switches > 0))
             keys.push(todayKey);
         if (keys.length === 0)
             return;
@@ -498,12 +493,14 @@ Item {
     // the new day accumulate. creditElapsed already files each chunk under the
     // date of its own timestamp, so a sample straddling midnight splits cleanly.
     onTodayKeyChanged: {
-        // The new day's file has not been read yet — hold its writes back again
-        // until todayLoader reports on the new key.
-        todayLoaded = false;
-        warnedHeldToday = false;
+        // Credit the chunk straddling midnight to the day that just ended (still
+        // loaded — sample() files it under its own pre-midnight timestamp), then
+        // flush it.
         sample();
         flush();
+        // The new day's file has not been read yet: sample() won't credit it and
+        // the writers hold it back until todayLoader reports on the new key.
+        todayLoaded = false;
         ensureDay(todayKey);
         refreshSummary();
     }
@@ -559,27 +556,19 @@ Item {
 
     // Load today's file (a shell restart mid-day must not lose the morning).
     // The path stays empty — so the FileView never touches disk — until
-    // maintenanceProc has exited cleanly, having hardened the dir and swept out
-    // anything a bare read should not follow. No timeout shortcut: a slow sweep
-    // must finish first. The belt-and-braces timer below may start crediting
-    // before this resolves; onLoaded folds that in rather than discarding it.
+    // maintenanceProc (and the replay step) have finished, having hardened the
+    // dir and swept out anything a bare read should not follow. No timeout
+    // shortcut: a slow sweep must finish first. sample() does not credit
+    // anything until this resolves, so the parsed record is a safe straight
+    // assignment.
     FileView {
         id: todayLoader
         path: root.dirReady ? (root.stateDir + "/" + root.todayKey + ".json") : ""
         watchChanges: false
         printErrors: false
         onLoaded: {
-            var disk = root.stripIgnored(Model.parseDay(text(), root.todayKey));
-            var mem = root.days[root.todayKey];
-            // If the fallback timer credited into an in-memory record before
-            // this read landed, flush() has been holding today back, so the
-            // file is still the untouched earlier state and the two fold
-            // together cleanly. Guarded on !todayLoaded so a second load for
-            // the same day (disk already holds the merged data) just assigns.
             var next = root.days;
-            next[root.todayKey] = (!root.todayLoaded && mem && (mem.totalSeconds > 0 || mem.switches > 0))
-                ? Model.mergeDay(disk, mem)
-                : disk;
+            next[root.todayKey] = root.stripIgnored(Model.parseDay(text(), root.todayKey));
             root.days = next;
             root.ready = true;
             root.todayLoaded = true;
@@ -596,7 +585,10 @@ Item {
         }
     }
 
-    // Belt and braces: if the FileView never reports back, start tracking anyway.
+    // Belt and braces: if maintenanceProc/replay/todayLoader stall, mark the
+    // service ready so the UI and IPC come alive. This does NOT set todayLoaded,
+    // so sample() still credits nothing until today's file is actually read —
+    // tracking that can't be reconciled with disk is not worth the clobber risk.
     Timer {
         interval: 4000
         running: !root.ready
@@ -625,18 +617,20 @@ Item {
         }
         onExited: function (exitCode) {
             if (exitCode === 0) {
-                // Confirmed on disk — now it is safe to forget these keys.
-                var d = root.dirty;
-                for (var i = 0; i < root.writingKeys.length; i++)
-                    delete d[root.writingKeys[i]];
-                root.dirty = d;
                 if (root.lastWriteFailed) {
                     root.lastWriteFailed = false;
                     console.log("wellbeing: writes recovered");
                 }
-            } else if (!root.lastWriteFailed) {
-                root.lastWriteFailed = true;
-                console.warn("wellbeing: write exited", exitCode, "— day data was not saved; keeping it queued to retry");
+            } else {
+                // Partial or failed write: re-queue every submitted key (a key
+                // re-dirtied mid-write is already marked; markDirty is a no-op
+                // for it) so the next flush retries.
+                for (var i = 0; i < root.writingKeys.length; i++)
+                    root.markDirty(root.writingKeys[i]);
+                if (!root.lastWriteFailed) {
+                    root.lastWriteFailed = true;
+                    console.warn("wellbeing: write exited", exitCode, "— day data was not saved; re-queued to retry");
+                }
             }
             root.writingKeys = [];
             if (root.writeAgain) {
