@@ -22,14 +22,10 @@ Item {
     property string omarchyPath: Quickshell.env("OMARCHY_PATH")
 
     readonly property string home: Quickshell.env("HOME")
-    // Honour XDG_STATE_HOME (bin/omarchy-wellbeing already does), so the reporter
-    // and the service always agree on where the data lives. Per the XDG spec a
-    // relative value is invalid and must be ignored.
-    readonly property string stateHome: {
-        var x = Quickshell.env("XDG_STATE_HOME");
-        return x && x.length > 0 && x[0] === "/" ? x : home + "/.local/state";
-    }
-    readonly property string stateDir: stateHome + "/omarchy/wellbeing"
+    // Resolve the data dir exactly as the bar widget and bin/omarchy-wellbeing
+    // do (honour an absolute XDG_STATE_HOME, ignore a relative one per the XDG
+    // spec) so all three always agree on where the data lives.
+    readonly property string stateDir: Model.stateDirFrom(home, Quickshell.env("XDG_STATE_HOME"))
 
     // The service loader does not hand a service its widget settings, so read the
     // widget's shell.json layout entry off the live shell config directly. This
@@ -96,11 +92,25 @@ Item {
     // Pending-write bookkeeping.
     property var dirty: ({})
     property bool writeAgain: false
+    // Keys handed to the running writeProc; cleared from `dirty` only once it
+    // exits 0 (see writeProc.onExited), so a partial or failed write leaves the
+    // records queued for the next attempt instead of dropping them.
+    property var writingKeys: []
+    property bool lastWriteFailed: false
+
+    // Set once today's file has been read back this session (todayLoader
+    // onLoaded/onLoadFailed). Until then the writers hold today's record back
+    // rather than risk a near-empty in-memory record overwriting a file whose
+    // contents this session has never seen. Reset on the midnight rollover.
+    property bool todayLoaded: false
+    property bool warnedHeldToday: false
 
     // maintenanceProc reports back through these, and only once it has actually
     // exited — a slow sweep can never expose an unswept file to todayLoader:
     //   dirReady    - the dir is one we own at 0700 and has been swept of
-    //                 anything a bare read must not follow. Gates the readers.
+    //                 anything a bare read must not follow. Gates the readers,
+    //                 and the writers (flush/flushDetached), so nothing touches
+    //                 the dir until it has been verified.
     //   dirRejected - the dir is a symlink or is not ours. The writers skip it
     //                 and the readers stay inert.
     property bool dirReady: false
@@ -117,7 +127,7 @@ Item {
     //     in on stdin (exactly `mode` lines); the shutdown flush drops them in
     //     an unpredictable `.shutdown-*` temp file (`mode` = `file:<path>`,
     //     confined to this dir) that a detached reader consumes and unlinks.
-    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || rm -f "$tmp"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  file:*)', '    f=${mode#file:}', '    case $f in "$dir"/.shutdown-*) ;; *) exit 0 ;; esac', '    { [ -f "$f" ] && [ ! -L "$f" ]; } || exit 0', '    chmod 600 "$f" 2>/dev/null || true', '    while IFS= read -r line; do', '      [ -n "$line" ] && write_one "$line"', '    done < <(timeout 5 dd if="$f" iflag=nofollow,count_bytes count=16777216 bs=65536 2>/dev/null)', '    rm -f "$f"', '    ;;', '  ""|*[!0-9]*)', '    ;;', '  *)', '    i=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 5 line || break', '      i=$((i + 1))', '      [ -n "$line" ] && write_one "$line"', '    done', '    ;;', 'esac'].join("\n")
+    readonly property string writeScript: ['set -u', 'dir=$1; mode=${2:-}', 'umask 077', '[ -n "$dir" ] || exit 64', 'if [ -L "$dir" ]; then echo "state dir $dir is a symlink; refusing to write, day data will not be saved" >&2; exit 65; fi', 'mkdir -p "$dir" || exit 66', '{ [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ]; } || { echo "state dir $dir is not a directory this user owns; refusing to write" >&2; exit 67; }', 'chmod 700 "$dir" 2>/dev/null || true', 'write_one() {', '  line=$1; key=${line%% *}; json=${line#* }', '  [ "$json" = "$line" ] && return 0', '  case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) return 0 ;; esac', '  tmp=$(mktemp "$dir/.$key.json.XXXXXX") || return 1', '  if printf "%s\\n" "$json" > "$tmp"; then', '    chmod 600 "$tmp" 2>/dev/null || true', '    if [ -d "$dir/$key.json" ] && [ ! -L "$dir/$key.json" ]; then rmdir "$dir/$key.json" 2>/dev/null || rm -rf -- "$dir/$key.json" 2>/dev/null || true; fi', '    mv -fT "$tmp" "$dir/$key.json" || rm -f "$tmp"', '  else', '    rm -f "$tmp"; return 1', '  fi', '}', 'case $mode in', '  file:*)', '    f=${mode#file:}', '    case $f in "$dir"/.shutdown-*) ;; *) exit 0 ;; esac', '    { [ -f "$f" ] && [ ! -L "$f" ]; } || exit 0', '    chmod 600 "$f" 2>/dev/null || true', '    while IFS= read -r line; do', '      [ -n "$line" ] && write_one "$line"', '    done < <(timeout 5 dd if="$f" iflag=nofollow,count_bytes count=16777216 bs=65536 2>/dev/null)', '    rm -f "$f"', '    ;;', '  ""|*[!0-9]*)', '    ;;', '  *)', '    i=0; rc=0', '    while [ "$i" -lt "$mode" ]; do', '      IFS= read -r -t 10 line || break', '      i=$((i + 1))', '      if [ -n "$line" ]; then write_one "$line" || rc=1; fi', '    done', '    [ "$i" -eq "$mode" ] || rc=1', '    exit "$rc"', '    ;;', 'esac'].join("\n")
 
     // Runs once at startup, before any day file is read. Guarantees the state
     // dir is one we own at 0700, then removes anything a reader (the FileViews
@@ -327,8 +337,8 @@ Item {
     }
 
     function flush() {
-        var keys = Object.keys(dirty);
-        if (keys.length === 0)
+        var all = Object.keys(dirty);
+        if (all.length === 0)
             return;
         if (dirRejected) {
             // maintenanceProc logged why the dir is unusable; drop the pending
@@ -336,6 +346,28 @@ Item {
             dirty = ({});
             return;
         }
+        // Wait for maintenanceProc to harden and sweep the dir before writing;
+        // whatever queues up in the meantime drains from onDirReadyChanged.
+        if (!dirReady)
+            return;
+
+        // Hold today's record back until its file has been read this session —
+        // a slow start must not let a near-empty in-memory record overwrite the
+        // morning still sitting on disk. Other days are always safe to write.
+        var keys = all;
+        if (!todayLoaded) {
+            keys = [];
+            for (var k = 0; k < all.length; k++)
+                if (all[k] !== todayKey)
+                    keys.push(all[k]);
+            if (!warnedHeldToday && keys.length !== all.length) {
+                warnedHeldToday = true;
+                console.warn("wellbeing: today's file has not loaded yet — holding its writes back so a slow start can't overwrite it");
+            }
+            if (keys.length === 0)
+                return;
+        }
+
         if (writeProc.running) {
             writeAgain = true;
             return;
@@ -343,27 +375,37 @@ Item {
 
         var lines = pendingLines(keys);
         if (lines.length === 0) {
-            dirty = ({});
+            var d = dirty;
+            for (var m = 0; m < keys.length; m++)
+                delete d[keys[m]];
+            dirty = d;
             return;
         }
 
         // Records stream in on stdin; only the state dir and the line count ride
-        // on argv. Write synchronously and clear `dirty` only once the lines are
-        // buffered to the process, so a stalled event loop can't strand them
-        // past the writer's read timeout. The writeScript hardens the dir on its
-        // own, so this does not need to wait on maintenanceProc.
+        // on argv. `dirty` is cleared for these keys only once writeProc exits 0
+        // (see onExited), so a partial or failed write keeps them queued.
         writeProc.command = ["bash", "-c", root.writeScript, "wellbeing-write", root.stateDir, String(lines.length)];
+        writingKeys = keys.slice();
         writeProc.running = true;
         for (var j = 0; j < lines.length; j++)
             writeProc.write(lines[j] + "\n");
-        dirty = ({});
     }
 
     function flushDetached() {
-        if (dirRejected)
+        // Only touch the dir once maintenanceProc has confirmed it is ours, not
+        // a symlink, and swept it — the shutdown payload carries window titles
+        // and app ids and must not be written through an unverified path.
+        if (!dirReady)
             return;
-        var keys = Object.keys(dirty);
-        if (keys.indexOf(todayKey) === -1 && days[todayKey])
+        var keys = [];
+        var dk = Object.keys(dirty);
+        for (var i = 0; i < dk.length; i++)
+            if (dk[i] !== todayKey)
+                keys.push(dk[i]);
+        // Force-add today (it is usually not "dirty" in the strict sense), but
+        // only once its file has been loaded this session.
+        if (todayLoaded && days[todayKey])
             keys.push(todayKey);
         if (keys.length === 0)
             return;
@@ -436,6 +478,10 @@ Item {
     // the new day accumulate. creditElapsed already files each chunk under the
     // date of its own timestamp, so a sample straddling midnight splits cleanly.
     onTodayKeyChanged: {
+        // The new day's file has not been read yet — hold its writes back again
+        // until todayLoader reports on the new key.
+        todayLoaded = false;
+        warnedHeldToday = false;
         sample();
         flush();
         ensureDay(todayKey);
@@ -492,28 +538,40 @@ Item {
     }
 
     // Load today's file (a shell restart mid-day must not lose the morning).
-    // Nothing is credited until this resolves, so the parsed record is a safe
-    // straight assignment rather than a merge. The path stays empty — so the
-    // FileView never touches disk — until maintenanceProc has exited cleanly,
-    // having hardened the dir and swept out anything a bare read should not
-    // follow. No timeout shortcut: a slow sweep must finish first.
+    // The path stays empty — so the FileView never touches disk — until
+    // maintenanceProc has exited cleanly, having hardened the dir and swept out
+    // anything a bare read should not follow. No timeout shortcut: a slow sweep
+    // must finish first. The belt-and-braces timer below may start crediting
+    // before this resolves; onLoaded folds that in rather than discarding it.
     FileView {
         id: todayLoader
         path: root.dirReady ? (root.stateDir + "/" + root.todayKey + ".json") : ""
         watchChanges: false
         printErrors: false
         onLoaded: {
+            var disk = root.stripIgnored(Model.parseDay(text(), root.todayKey));
+            var mem = root.days[root.todayKey];
+            // If the fallback timer credited into an in-memory record before
+            // this read landed, flush() has been holding today back, so the
+            // file is still the untouched earlier state and the two fold
+            // together cleanly. Guarded on !todayLoaded so a second load for
+            // the same day (disk already holds the merged data) just assigns.
             var next = root.days;
-            next[root.todayKey] = root.stripIgnored(Model.parseDay(text(), root.todayKey));
+            next[root.todayKey] = (!root.todayLoaded && mem && (mem.totalSeconds > 0 || mem.switches > 0))
+                ? Model.mergeDay(disk, mem)
+                : disk;
             root.days = next;
             root.ready = true;
+            root.todayLoaded = true;
             root.markDirty(root.todayKey);
             root.restampToday();
             root.refreshSummary();
+            root.flush();
         }
         onLoadFailed: {
             root.ensureDay(root.todayKey);
             root.ready = true;
+            root.todayLoaded = true;
             root.refreshSummary();
         }
     }
@@ -546,8 +604,21 @@ Item {
             }
         }
         onExited: function (exitCode) {
-            if (exitCode !== 0)
-                console.warn("wellbeing: write exited", exitCode, "— day data was not saved");
+            if (exitCode === 0) {
+                // Confirmed on disk — now it is safe to forget these keys.
+                var d = root.dirty;
+                for (var i = 0; i < root.writingKeys.length; i++)
+                    delete d[root.writingKeys[i]];
+                root.dirty = d;
+                if (root.lastWriteFailed) {
+                    root.lastWriteFailed = false;
+                    console.log("wellbeing: writes recovered");
+                }
+            } else if (!root.lastWriteFailed) {
+                root.lastWriteFailed = true;
+                console.warn("wellbeing: write exited", exitCode, "— day data was not saved; keeping it queued to retry");
+            }
+            root.writingKeys = [];
             if (root.writeAgain) {
                 root.writeAgain = false;
                 root.flush();

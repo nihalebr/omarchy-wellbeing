@@ -5,6 +5,20 @@
 
 var DAY_MS = 86400000
 
+// ---------------------------------------------------------------- state dir
+//
+// The service, the bar widget and bin/omarchy-wellbeing must all resolve the
+// data directory the same way. Honour an absolute XDG_STATE_HOME; per the XDG
+// spec a relative value is invalid and is ignored. bin/omarchy-wellbeing
+// repeats this in bash — keep the three in step.
+
+function stateDirFrom(home, xdgStateHome) {
+  var base = xdgStateHome && xdgStateHome.length > 0 && xdgStateHome.charAt(0) === "/"
+    ? xdgStateHome
+    : String(home || "") + "/.local/state"
+  return base + "/omarchy/wellbeing"
+}
+
 // ---------------------------------------------------------------- day records
 //
 // One JSON file per local day at
@@ -72,6 +86,36 @@ function recomputeTotal(day) {
   var total = 0
   for (var id in day.apps) total += Math.max(0, day.apps[id].seconds || 0)
   return total
+}
+
+// Fold the counters from `add` into `base`, in place, and return `base`. Used
+// once at load time: when the belt-and-braces startup timer credited time into
+// an in-memory record before today's file came back from disk, the disk record
+// is the untouched earlier state and `add` is what accumulated while we waited.
+// The two spans are disjoint, so every counter sums cleanly.
+function mergeDay(base, add) {
+  if (!add) return base
+  if (!base) return add
+  base.switches = Math.max(0, safeInt(base.switches, 0)) + Math.max(0, safeInt(add.switches, 0))
+  var addApps = add.apps && typeof add.apps === "object" ? add.apps : {}
+  for (var id in addApps) {
+    var a = addApps[id]
+    if (!a || typeof a !== "object") continue
+    var b = base.apps[id]
+    if (!b) {
+      b = { seconds: 0, opens: 0, lastTitle: "", name: "" }
+      base.apps[id] = b
+    }
+    b.seconds = Math.max(0, safeInt(b.seconds, 0)) + Math.max(0, safeInt(a.seconds, 0))
+    b.opens = Math.max(0, safeInt(b.opens, 0)) + Math.max(0, safeInt(a.opens, 0))
+    if (a.lastTitle) b.lastTitle = a.lastTitle
+    if (a.name) b.name = a.name
+  }
+  var addBins = Array.isArray(add.bins) ? add.bins : []
+  for (var h = 0; h < 24; h++) base.bins[h] = Math.max(0, safeInt(base.bins[h], 0)) + Math.max(0, safeInt(addBins[h], 0))
+  if (add.updated) base.updated = add.updated
+  base.totalSeconds = recomputeTotal(base)
+  return base
 }
 
 // Add `seconds` of use of `appId` at local hour `hour` to a day record, in

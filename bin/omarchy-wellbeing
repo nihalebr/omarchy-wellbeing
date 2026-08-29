@@ -12,6 +12,7 @@
 set -euo pipefail
 
 # Per the XDG spec a relative XDG_STATE_HOME is invalid and must be ignored.
+# The QML side resolves this identically in Model.stateDirFrom() — keep in step.
 STATE_HOME="${XDG_STATE_HOME:-}"
 [[ $STATE_HOME == /* ]] || STATE_HOME="$HOME/.local/state"
 STATE_DIR="$STATE_HOME/omarchy/wellbeing"
@@ -108,6 +109,13 @@ cmd_day() {
   # regular-file check and the reads can't straddle a swap.
   if ! content=$(read_day "$f") || [[ -z $content ]]; then
     echo "No data for $key"
+    exit 0
+  fi
+  # A file past the read cap comes back truncated (invalid JSON). Validate the
+  # shape once here so every jq below — including --json — has a well-formed
+  # object to work on instead of aborting mid-command under `set -e`.
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$content"; then
+    echo "Data for $key looks corrupt or truncated ($f)"
     exit 0
   fi
   if (( json )); then

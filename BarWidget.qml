@@ -16,13 +16,8 @@ BarWidget {
     moduleName: "nihalebr.wellbeing"
 
     readonly property string home: Quickshell.env("HOME")
-    // Match the service and bin/omarchy-wellbeing: honour an absolute
-    // XDG_STATE_HOME, ignore a relative one per the XDG spec.
-    readonly property string stateHome: {
-        var x = Quickshell.env("XDG_STATE_HOME");
-        return x && x.length > 0 && x[0] === "/" ? x : home + "/.local/state";
-    }
-    readonly property string stateDir: stateHome + "/omarchy/wellbeing"
+    // Resolve the data dir exactly as the service and bin/omarchy-wellbeing do.
+    readonly property string stateDir: Model.stateDirFrom(home, Quickshell.env("XDG_STATE_HOME"))
 
     readonly property bool showLabel: String(setting("showLabel", "Off")) === "On"
     readonly property int goalMinutes: {
@@ -99,12 +94,27 @@ BarWidget {
         var svc = service();
         if (svc && svc.flush)
             svc.flush();
-        Qt.callLater(function () {
-            todayFile.reload();
-            dayFile.reload();
-            historyProc.running = false;
-            historyProc.running = true;
-        });
+        // Redraw now with whatever is already on disk, then again once the
+        // flush we just asked for has had time to land — the Process readers
+        // have no file watch to catch the write on their own.
+        reloadAll();
+        settleTimer.restart();
+    }
+
+    function reloadAll() {
+        reloadToday();
+        reloadDay();
+        historyProc.running = false;
+        historyProc.running = true;
+    }
+
+    function reloadToday() {
+        todayProc.running = false;
+        todayProc.running = true;
+    }
+    function reloadDay() {
+        dayProc.running = false;
+        dayProc.running = true;
     }
 
     function step(delta) {
@@ -143,44 +153,61 @@ BarWidget {
         precision: SystemClock.Minutes
     }
 
-    onSelectedKeyChanged: Qt.callLater(dayFile.reload)
+    onSelectedKeyChanged: Qt.callLater(root.reloadDay)
+    onTodayKeyChanged: Qt.callLater(root.reloadToday)
 
     // ---- data files -----------------------------------------------------
+    //
+    // Pure readers, hardened like historyProc: each day file is slurped through
+    // `dd iflag=nofollow` (O_NOFOLLOW — a symlink swapped in for a day file is
+    // rejected, not followed), an 8 MB cap (the largest file the service keeps,
+    // so a real record is never truncated into invalid JSON) and a 5s timeout
+    // (a planted FIFO can't wedge the panel). The dir is skipped if it is
+    // missing or a symlink; the key is checked so it can only name a day file.
+    readonly property string readDayScript: 'dir=$1; key=$2; ' + 'case $key in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) exit 0 ;; esac; ' + '{ [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'exec timeout 5 dd if="$dir/$key.json" iflag=nofollow,count_bytes count=8388608 bs=65536 2>/dev/null'
 
-    FileView {
-        id: todayFile
-        path: root.stateDir + "/" + root.todayKey + ".json"
-        watchChanges: true
-        printErrors: false
-        onLoaded: root.todayData = Model.parseDay(text(), root.todayKey)
-        onLoadFailed: root.todayData = Model.emptyDay(root.todayKey)
-        onFileChanged: reload()
+    Process {
+        id: todayProc
+        running: true
+        command: ["bash", "-c", root.readDayScript, "wellbeing-today", root.stateDir, root.todayKey]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.todayData = Model.parseDay(text, root.todayKey)
+        }
     }
 
-    // The service replaces the day file with an atomic rename, which can break
-    // an inode-based watch after the first write. This keeps the bar label and
-    // tooltip current regardless of whether the watch is following. The popup
-    // has its own explicit reload on open, so this stays gentle.
+    Process {
+        id: dayProc
+        running: true
+        command: ["bash", "-c", root.readDayScript, "wellbeing-day", root.stateDir, root.selectedKey]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.dayData = Model.parseDay(text, root.selectedKey)
+        }
+    }
+
+    // The service rewrites day files with an atomic rename and there is no file
+    // watch here, so poll to keep the bar label and tooltip current. The popup
+    // has its own explicit reload on open (refreshNow), so this stays gentle.
     Timer {
         interval: 30000
         repeat: true
         running: true
         triggeredOnStart: false
         onTriggered: {
-            todayFile.reload();
+            root.reloadToday();
             if (root.selectedKey !== root.todayKey)
-                dayFile.reload();
+                root.reloadDay();
         }
     }
 
-    FileView {
-        id: dayFile
-        path: root.stateDir + "/" + root.selectedKey + ".json"
-        watchChanges: true
-        printErrors: false
-        onLoaded: root.dayData = Model.parseDay(text(), root.selectedKey)
-        onLoadFailed: root.dayData = Model.emptyDay(root.selectedKey)
-        onFileChanged: reload()
+    // One re-read a beat after refreshNow()'s flush, to pick up the write once
+    // the detached writer has renamed it into place.
+    Timer {
+        id: settleTimer
+        interval: 400
+        repeat: false
+        onTriggered: root.reloadAll()
     }
 
     Process {
