@@ -392,14 +392,14 @@ Item {
             lastSampleAt = Date.now();
             refreshSummary();
         }
-        // `key` is already validated as YYYY-MM-DD above. Harden against TOCTOU:
-        // enter the physical directory once with `cd -P` (resolves symlinks and
-        // gives us a handle to the actual directory inode), verify we own it,
-        // then remove only relative filenames — a subsequent swap of the
-        // configured path cannot redirect deletion since our working directory
-        // is bound to the inode we validated, not a re-resolved pathname.
+        // `key` is validated as YYYY-MM-DD above; re-check it here too. Replaces
+        // the earlier `cd -P` guard: `cd -P` follows a symlinked stateDir into
+        // its target and would delete there, whereas GNU `find` with a bare
+        // (non-slashed) start path does not descend a symlinked directory at
+        // all — and it opens the directory once, so a post-check swap of the
+        // path cannot redirect the delete either.
         if (!dirRejected)
-            Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; cd -P -- "$d" 2>/dev/null || exit 0; [ -d . ] && [ -O . ] || exit 0; rm -f -- "./$k.json" "./$k.json.part"; rm -f -- "./.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
+            Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; case $k in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) exit 0 ;; esac; [ ! -L "$d" ] && [ -d "$d" ] && [ -O "$d" ] || exit 0; exec find "$d" -maxdepth 1 -type f \\( -name "$k.json" -o -name "$k.json.part" -o -name ".$k.json.*" \\) -delete', "wellbeing-reset", root.stateDir, key]);
         return "ok";
     }
 

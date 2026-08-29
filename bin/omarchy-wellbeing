@@ -16,14 +16,21 @@ STATE_HOME="${XDG_STATE_HOME:-}"
 [[ $STATE_HOME == /* ]] || STATE_HOME="$HOME/.local/state"
 STATE_DIR="$STATE_HOME/omarchy/wellbeing"
 
-# The reporter only ever reads. Refuse a state dir that is a symlink, and treat
-# only plain files as day files, so a planted link can't redirect a read.
+# The reporter only ever reads. Refuse a state dir that is a symlink so a
+# planted link can't redirect the whole tree.
 if [[ -L $STATE_DIR ]]; then
   echo "omarchy-wellbeing: $STATE_DIR is a symlink; refusing" >&2
   exit 1
 fi
 
-is_day_file() { [[ -f $1 && ! -L $1 ]]; }
+# Slurp one day file safely. `dd iflag=nofollow` opens with O_NOFOLLOW, so a
+# symlink swapped in after any earlier check is rejected outright rather than
+# followed to its target; the byte cap is the 8 MB the service treats as the
+# largest legitimate day file; the timeout means a planted FIFO can't wedge the
+# reporter. Prints the contents (empty, non-zero exit, on anything rejected).
+read_day() {
+  timeout 5 dd if="$1" iflag=nofollow,count_bytes count=8388608 bs=65536 2>/dev/null
+}
 
 usage() {
   cat <<EOF
@@ -58,16 +65,16 @@ fmt_dur() { # seconds -> "1h 04m" / "12m" / "8s"
 }
 
 day_total() {
-  local f="$STATE_DIR/$1.json"
-  is_day_file "$f" || { echo 0; return; }
-  jq -r '[.apps[].seconds] | add // 0 | floor' "$f"
+  local c
+  if ! c=$(read_day "$STATE_DIR/$1.json") || [[ -z $c ]]; then echo 0; return; fi
+  jq -r '[.apps[].seconds] | add // 0 | floor' <<<"$c" 2>/dev/null || echo 0
 }
 
 cmd_list() {
   [[ -d $STATE_DIR ]] || { echo "No data yet ($STATE_DIR)"; exit 0; }
   local f b
   for f in "$STATE_DIR"/*.json; do
-    is_day_file "$f" || continue
+    [[ -f $f && ! -L $f ]] || continue
     b=$(basename "$f" .json)
     printf '%s  %s\n' "$b" "$(fmt_dur "$(day_total "$b")")"
   done
@@ -93,34 +100,36 @@ cmd_day() {
       *) day="$a" ;;
     esac
   done
-  local key f
+  local key f content
   key=$(resolve_day "${day:-today}")
   f="$STATE_DIR/$key.json"
 
-  if ! is_day_file "$f"; then
+  # One safe read; every jq below works off the captured text, so the
+  # regular-file check and the reads can't straddle a swap.
+  if ! content=$(read_day "$f") || [[ -z $content ]]; then
     echo "No data for $key"
     exit 0
   fi
   if (( json )); then
-    jq . "$f"
+    jq . <<<"$content"
     exit 0
   fi
 
   local total switches napps
-  total=$(jq -r '[.apps[].seconds] | add // 0 | floor' "$f")
-  switches=$(jq -r '.switches // 0' "$f")
-  napps=$(jq -r '[.apps[] | select(.seconds > 0)] | length' "$f")
+  total=$(jq -r '[.apps[].seconds] | add // 0 | floor' <<<"$content")
+  switches=$(jq -r '.switches // 0' <<<"$content")
+  napps=$(jq -r '[.apps[] | select(.seconds > 0)] | length' <<<"$content")
 
   printf '\e[1m%s\e[0m   %s screen time   ·   %s apps   ·   %s switches\n\n' \
     "$key" "$(fmt_dur "$total")" "$napps" "$switches"
 
   # rows: "seconds\tappId"
   local maxsec
-  maxsec=$(jq -r '[.apps[].seconds] | max // 1' "$f")
+  maxsec=$(jq -r '[.apps[].seconds] | max // 1' <<<"$content")
   jq -r '.apps | to_entries
          | map(select(.value.seconds > 0))
          | sort_by(-.value.seconds)[]
-         | "\(.value.seconds|floor)\t\(.key)\t\(.value.name // "")"' "$f" |
+         | "\(.value.seconds|floor)\t\(.key)\t\(.value.name // "")"' <<<"$content" |
   while IFS=$'\t' read -r sec appid name; do
     local bar=""
     [[ -z $name ]] && name=$(pretty_name "$appid")

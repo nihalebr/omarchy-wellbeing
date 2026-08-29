@@ -185,11 +185,12 @@ BarWidget {
 
     Process {
         id: historyProc
-        // Reader: skip a state dir or day file that is a symlink, and cap each
-        // read at the same 8 MB the service treats as the largest legitimate day
-        // file, so this can never be pointed at an unrelated or unbounded file
-        // and never truncates a real record into invalid JSON.
-        command: ["bash", "-c", 'dir="$1"; { [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + '{ [ -f "$f" ] && [ ! -L "$f" ]; } || continue; ' + 'b=$(basename "$f" .json); printf "===%s===\\n" "$b"; head -c 8000000 "$f"; printf "\\n"; done', "wellbeing-history", root.stateDir]
+        // Reader: `dd iflag=nofollow` opens each file with O_NOFOLLOW (a symlink
+        // swapped in after the glob is rejected, not followed), the byte cap is
+        // the 8 MB the service treats as the largest legitimate day file (so a
+        // real record is never truncated into invalid JSON), and the timeout
+        // means a planted FIFO can't wedge the widget.
+        command: ["bash", "-c", 'dir="$1"; { [ -d "$dir" ] && [ ! -L "$dir" ]; } || exit 0; ' + 'ls -1 "$dir"/*.json 2>/dev/null | sort | tail -n 60 | while read -r f; do ' + 'c=$(timeout 5 dd if="$f" iflag=nofollow,count_bytes count=8388608 bs=65536 2>/dev/null) || continue; ' + '[ -n "$c" ] || continue; ' + 'printf "===%s===\\n%s\\n" "$(basename "$f" .json)" "$c"; done', "wellbeing-history", root.stateDir]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: root.history = Model.parseHistoryDump(text)
