@@ -392,11 +392,14 @@ Item {
             lastSampleAt = Date.now();
             refreshSummary();
         }
-        // `key` is already validated as YYYY-MM-DD above. Guard the dir the same
-        // way the writer does — a symlinked or swapped stateDir must not let this
-        // rm resolve into some other directory.
+        // `key` is already validated as YYYY-MM-DD above. Harden against TOCTOU:
+        // enter the physical directory once with `cd -P` (resolves symlinks and
+        // gives us a handle to the actual directory inode), verify we own it,
+        // then remove only relative filenames — a subsequent swap of the
+        // configured path cannot redirect deletion since our working directory
+        // is bound to the inode we validated, not a re-resolved pathname.
         if (!dirRejected)
-            Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; { [ -d "$d" ] && [ ! -L "$d" ] && [ -O "$d" ]; } || exit 0; rm -f -- "$d/$k.json" "$d/$k.json.part"; rm -f -- "$d/.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
+            Quickshell.execDetached(["bash", "-c", 'd=$1; k=$2; cd -P -- "$d" 2>/dev/null || exit 0; [ -d . ] && [ -O . ] || exit 0; rm -f -- "./$k.json" "./$k.json.part"; rm -f -- "./.$k.json."* 2>/dev/null', "wellbeing-reset", root.stateDir, key]);
         return "ok";
     }
 
