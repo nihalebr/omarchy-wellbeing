@@ -88,36 +88,6 @@ function recomputeTotal(day) {
   return total
 }
 
-// Fold the counters from `add` into `base`, in place, and return `base`. Used
-// once at load time: when the belt-and-braces startup timer credited time into
-// an in-memory record before today's file came back from disk, the disk record
-// is the untouched earlier state and `add` is what accumulated while we waited.
-// The two spans are disjoint, so every counter sums cleanly.
-function mergeDay(base, add) {
-  if (!add) return base
-  if (!base) return add
-  base.switches = Math.max(0, safeInt(base.switches, 0)) + Math.max(0, safeInt(add.switches, 0))
-  var addApps = add.apps && typeof add.apps === "object" ? add.apps : {}
-  for (var id in addApps) {
-    var a = addApps[id]
-    if (!a || typeof a !== "object") continue
-    var b = base.apps[id]
-    if (!b) {
-      b = { seconds: 0, opens: 0, lastTitle: "", name: "" }
-      base.apps[id] = b
-    }
-    b.seconds = Math.max(0, safeInt(b.seconds, 0)) + Math.max(0, safeInt(a.seconds, 0))
-    b.opens = Math.max(0, safeInt(b.opens, 0)) + Math.max(0, safeInt(a.opens, 0))
-    if (a.lastTitle) b.lastTitle = a.lastTitle
-    if (a.name) b.name = a.name
-  }
-  var addBins = Array.isArray(add.bins) ? add.bins : []
-  for (var h = 0; h < 24; h++) base.bins[h] = Math.max(0, safeInt(base.bins[h], 0)) + Math.max(0, safeInt(addBins[h], 0))
-  if (add.updated) base.updated = add.updated
-  base.totalSeconds = recomputeTotal(base)
-  return base
-}
-
 // Add `seconds` of use of `appId` at local hour `hour` to a day record, in
 // place. Called once per sample tick by the Service.
 function creditDay(day, appId, title, seconds, hour) {
